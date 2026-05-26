@@ -1,0 +1,27 @@
+# 虚拟环境
+basketball_env/
+venv/
+env/
+ENV/
+
+# 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 大文件
+*.mp4
+*.avi
+*.mov
+*.zip
+*.tar
+*.gz
+*.h5
+*.pth
+*.onnx
+basketball_env/
