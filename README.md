@@ -29,14 +29,18 @@ This tool makes professional-level coaching accessible to everyone.
 
 ## 📸 Demo
 
-[在这里插入GIF或截图]
+<img width="876" height="1557" alt="image" src="https://github.com/user-attachments/assets/3e7c0c11-535c-4584-b898-fcf5142d0403" />
+
+<img width="876" height="1564" alt="image" src="https://github.com/user-attachments/assets/e9268def-8fe7-4b99-913e-881613a5fe8e" />
+
+<img width="437" height="783" alt="Screenshot 2026-05-26 at 10 39 20 AM" src="https://github.com/user-attachments/assets/98c8dbe2-fb70-4165-afbf-22a0c23c19c9" />
 
 ---
 
 ## 🚀 How to Run
 
 ```bash
-git clone https://github.com/yourname/basketball-motion-analyzer
+git clone https://github.com/RyanZongSu/basketball-motion-analyzer
 cd basketball-motion-analyzer
 pip install -r requirements.txt
 python basketball_pose.py --video your_video.mp4
