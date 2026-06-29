@@ -1,0 +1,22 @@
+# 导出数据文件，本地生成不上传
+*.csv
+output/
+output_csv/
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+# VS Code临时文件
+tempCodeRunnerFile.py
+.vscode/
+# 环境、日志
+*.log
+exports/
+*.csv
+output/
+output_csv/
+__pycache__/
+tempCodeRunnerFile.py
+.vscode/
+*.log
