@@ -20,3 +20,6 @@ __pycache__/
 tempCodeRunnerFile.py
 .vscode/
 *.log
+.DS_Store
+*.pt
+run_env.sh
