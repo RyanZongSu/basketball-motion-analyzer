@@ -25,6 +25,7 @@ Changes in v2.4 (over v2.3):
 import os
 import pickle
 import csv
+import hashlib
 from datetime import datetime
 
 import cv2
@@ -32,6 +33,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 import tkinter as tk
@@ -91,9 +93,17 @@ def calculate_joint_angle(p1, mid, p2):
     return float(np.degrees(np.arccos(cos)))
 
 
-def load_or_build_cache(video_path,
-                        cache_file=CACHE_FILE,
-                        angle_file=ANGLE_FILE):
+def _cache_paths_for_video(video_path):
+    base = os.path.splitext(os.path.basename(video_path))[0]
+    digest = hashlib.md5(os.path.abspath(video_path).encode("utf-8")).hexdigest()[:10]
+    cache_file = f"{base}_{digest}_{CACHE_FILE}"
+    angle_file = f"{base}_{digest}_{ANGLE_FILE}"
+    return cache_file, angle_file
+
+
+def load_or_build_cache(video_path, cache_file=None, angle_file=None):
+    if cache_file is None or angle_file is None:
+        cache_file, angle_file = _cache_paths_for_video(video_path)
     cap = cv2.VideoCapture(video_path)
 
     if os.path.exists(cache_file) and os.path.exists(angle_file):
@@ -243,8 +253,8 @@ class BasketballAnalyzerApp:
     BTN_HOVER  = "#CED4DA"
     STATUS_BG  = "#F1F3F5"
 
-    CHART_COLORS = ["#1971C2", "#F76707", "#0CA678", "#C92A2A"]
-    CHART_LABELS = ["Left Elbow", "Right Elbow", "Left Knee", "Right Knee"]
+    CHART_COLORS = ["#1971C2", "#0CA678"]
+    CHART_LABELS = ["Shooting Elbow", "Power Knee"]
     CSV_FIELDS = [
         "frame", "time_sec", "player_id", "shot_id",
         "shot_start_frame", "shot_end_frame",
@@ -275,11 +285,12 @@ class BasketballAnalyzerApp:
         "hip_height_norm", "event_label"
     ]
 
-    def __init__(self, root, video_path, cache, id_angle_data, total_frames):
+    def __init__(self, root, video_path=None, cache=None, id_angle_data=None,
+                 total_frames=0):
         self.root          = root
         self.video_path    = video_path
-        self.cache         = cache
-        self.id_angle_data = id_angle_data
+        self.cache         = cache or []
+        self.id_angle_data = id_angle_data or {}
         self.total_frames  = total_frames
 
         self.current_frame    = 0
@@ -290,13 +301,33 @@ class BasketballAnalyzerApp:
         self.linked_ids  = set()
         self.history_ids = set()
         self._was_lost   = False
+        self.id_analysis_rows = {}
+        self._analysis_cache_key = None
+        self._analysis_rows_cache = None
+        self._analysis_rows_by_frame = {}
+        self._current_chart_shot_id = None
+        self._selected_shot_id = None
+        self._manual_shot_sides = {}
+        self._pending_shot_sides = {}
+        self._manual_recalc_version = 0
+        self.release_line = None
+        self.playhead_line = None
+        self.ax_time = None
+        self.no_data_text = None
+        self.highlight_dots = []
+        self.event_markers = []
+        self.chart_tabs_frame = None
 
-        self.cap = cv2.VideoCapture(video_path)
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self.cap = cv2.VideoCapture(video_path) if video_path else None
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS) if self.cap else 30.0
+        self.fps = self.fps or 30.0
 
-        self.video_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.video_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.video_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH)) if self.cap else 0
+        self.video_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) if self.cap else 0
         self._compute_display_size(self.video_w, self.video_h)
+        self._last_video_label_size = None
+        if self.video_path:
+            self._precompute_all_id_analysis()
 
         self._build_ui()
         self._build_chart()
@@ -305,6 +336,8 @@ class BasketballAnalyzerApp:
     # ── Adaptive sizing ───────────────────────────────────────────────────────
 
     def _compute_display_size(self, vid_w, vid_h, panel_w=700, panel_h=560):
+        panel_w = max(160, int(panel_w))
+        panel_h = max(120, int(panel_h))
         if vid_h == 0 or vid_w == 0:
             self.display_w, self.display_h = panel_w, panel_h
             return
@@ -352,9 +385,12 @@ class BasketballAnalyzerApp:
     def _update_lost_status(self):
         self._was_lost = self._is_tracking_lost()
         if not self.history_ids:
-            self.title_hint.config(
-                text="Click a player in the video to start tracking",
-                fg=self.TEXT_DIM)
+            hint = (
+                "Click Open Video to choose a video"
+                if not self.video_path
+                else "Click a player in the video to start tracking"
+            )
+            self.title_hint.config(text=hint, fg=self.TEXT_DIM)
         elif self._was_lost:
             self.title_hint.config(
                 text="⚠  Tracking lost — click Reset, then re-click the player",
@@ -370,58 +406,527 @@ class BasketballAnalyzerApp:
         if ids_to_show is None:
             ids_to_show = self.history_ids
 
-        x      = np.arange(self.total_frames)
-        merged = np.full((self.total_frames, 4), np.nan)
+        x = np.arange(self.total_frames)
+        shooting_elbow = np.full(self.total_frames, np.nan)
+        power_knee = np.full(self.total_frames, np.nan)
 
-        for pid in ids_to_show:
-            if pid not in self.id_angle_data:
+        rows = self._get_analysis_rows(ids_to_show)
+        shot_rows = [r for r in rows if r.get("shot_id") != ""]
+        available_shots = sorted({r["shot_id"] for r in shot_rows})
+        if self._selected_shot_id in available_shots:
+            chart_shot_id = self._selected_shot_id
+        else:
+            chart_shot_id = available_shots[0] if available_shots else None
+            self._selected_shot_id = chart_shot_id
+        self._current_chart_shot_id = chart_shot_id
+        for row in rows:
+            if row.get("shot_id") != chart_shot_id:
                 continue
-            d    = self.id_angle_data[pid]
-            mask = np.isnan(merged) & ~np.isnan(d)
-            merged[mask] = d[mask]
+            if not row.get("shooting_hand") and not row.get("power_leg"):
+                continue
+            frame = row.get("frame")
+            if frame is None or frame < 0 or frame >= self.total_frames:
+                continue
+            shooting_hand = row.get("shooting_hand", "")
+            power_leg = row.get("power_leg", "")
+            if shooting_hand == "left":
+                shooting_elbow[frame] = row.get("left_elbow_angle", np.nan)
+            elif shooting_hand == "right":
+                shooting_elbow[frame] = row.get("right_elbow_angle", np.nan)
+            if power_leg == "left":
+                power_knee[frame] = row.get("left_knee_angle", np.nan)
+            elif power_leg == "right":
+                power_knee[frame] = row.get("right_knee_angle", np.nan)
 
-        for i, line in enumerate(self.chart_lines):
-            line.set_data(x, merged[:, i])
+        self.chart_lines[0].set_data(x, shooting_elbow)
+        self.chart_lines[1].set_data(x, power_knee)
+        for line in (self.release_line, self.playhead_line):
+            if line is not None:
+                line.set_visible(False)
+        for dot in self.highlight_dots:
+            dot.set_data([], [])
+        for marker, text in self.event_markers:
+            marker.set_data([], [])
+            text.set_visible(False)
 
-        self.graph_status_lbl.config(
-            text=f"Player IDs: {sorted(ids_to_show)}" if ids_to_show else "")
+        if shot_rows:
+            self._set_chart_data_mode()
+            first_shot_rows = [
+                r for r in shot_rows if r.get("shot_id") == chart_shot_id
+            ]
+            shot_start = min(r["frame"] for r in first_shot_rows)
+            shot_end = max(r["frame"] for r in first_shot_rows)
+            pad = max(3, int(round(0.15 * self.fps)))
+            x0 = max(0, shot_start - pad)
+            x1 = min(self.total_frames - 1, shot_end + pad)
+            self.ax.set_xlim(x0, x1)
+            if self.ax_time is not None:
+                self.ax_time.set_xlim(x0 / self.fps, x1 / self.fps)
+            release_rows = [
+                r for r in first_shot_rows if r.get("is_release_frame")
+            ]
+            if release_rows and self.release_line is not None:
+                release_x = release_rows[0]["frame"]
+                self.release_line.set_xdata([release_x, release_x])
+                self.release_line.set_visible(True)
+            self._draw_event_markers(first_shot_rows)
+            visible_values = np.concatenate([
+                shooting_elbow[~np.isnan(shooting_elbow)],
+                power_knee[~np.isnan(power_knee)]
+            ])
+            if len(visible_values):
+                ymax = min(205, max(185, float(np.nanmax(visible_values)) + 24))
+                self.ax.set_ylim(0, ymax)
+            self.graph_status_lbl.config(
+                text=(f"IDs: {sorted(ids_to_show)}  ·  "
+                      f"Shot {chart_shot_id}: frames {shot_start}-{shot_end}"))
+        else:
+            self._current_chart_shot_id = None
+            self.ax.set_ylim(0, 190)
+            self.ax.set_xlim(0, 1)
+            if self.ax_time is not None:
+                self.ax_time.set_xlim(0, 1 / self.fps)
+            self.graph_status_lbl.config(
+                text="")
+            self._set_chart_blank()
+
+        self._refresh_chart_tabs(available_shots)
         self.canvas.draw_idle()
+
+    def _set_chart_blank(self, message="No Data Available"):
+        if self.no_data_text is not None:
+            self.no_data_text.set_text(message)
+            self.no_data_text.set_visible(True)
+        self.ax.title.set_visible(False)
+        self.ax.set_axis_off()
+        if self.ax_time is not None:
+            self.ax_time.set_axis_off()
+        legend = self.ax.get_legend()
+        if legend is not None:
+            legend.set_visible(False)
+
+    def _set_chart_data_mode(self):
+        self.ax.set_axis_on()
+        self.ax.title.set_visible(True)
+        if self.ax_time is not None:
+            self.ax_time.set_axis_on()
+        if self.no_data_text is not None:
+            self.no_data_text.set_visible(False)
+        legend = self.ax.get_legend()
+        if legend is not None:
+            legend.set_visible(True)
+
+    def _refresh_chart_tabs(self, shot_ids=None):
+        if self.chart_tabs_frame is None:
+            return
+        for child in self.chart_tabs_frame.winfo_children():
+            child.destroy()
+        if not shot_ids:
+            return
+        for shot_id in shot_ids:
+            active = shot_id == self._current_chart_shot_id
+            bg = self.ACCENT_LT if active else self.SURFACE
+            fg = self.ACCENT if active else self.TEXT_DIM
+            underline = "  " if active else ""
+            tab = tk.Label(
+                self.chart_tabs_frame,
+                text=f"{underline}Shot {shot_id}{underline}",
+                bg=bg, fg=fg, font=("Menlo", 12, "bold" if active else "normal"),
+                padx=12, pady=5, cursor="hand2",
+                highlightbackground=self.ACCENT if active else self.BORDER,
+                highlightthickness=1)
+            tab.pack(side="left", padx=(0,4), pady=(0,2))
+            tab.bind("<Button-1>", lambda _e, sid=shot_id: self._select_shot(sid))
 
     def update_highlight(self):
         if not self.history_ids:
-            self.highlight_dot.set_data([], [])
+            self.update_full_graph(set())
+            if self.playhead_line is not None:
+                self.playhead_line.set_visible(False)
+            for dot in self.highlight_dots:
+                dot.set_data([], [])
             self.canvas.draw_idle()
             return
 
-        val = np.nan
-        for pid in list(self.linked_ids) + list(self.history_ids):
-            if pid in self.id_angle_data:
-                cf = min(self.current_frame, self.id_angle_data[pid].shape[0]-1)
-                v  = self.id_angle_data[pid][cf, 1]
-                if not np.isnan(v):
-                    val = v
-                    break
+        row = self._get_analysis_row_for_frame(
+            self.current_frame, preferred_ids=self._get_frame_history_ids())
+        elbow_val = np.nan
+        knee_val = np.nan
+        show_marker = bool(
+            row and row.get("shot_id") == self._current_chart_shot_id
+        )
+        if row:
+            shooting_hand = row.get("shooting_hand", "")
+            if shooting_hand == "left":
+                elbow_val = row.get("left_elbow_angle", np.nan)
+            elif shooting_hand == "right":
+                elbow_val = row.get("right_elbow_angle", np.nan)
+            power_leg = row.get("power_leg", "")
+            if power_leg == "left":
+                knee_val = row.get("left_knee_angle", np.nan)
+            elif power_leg == "right":
+                knee_val = row.get("right_knee_angle", np.nan)
 
-        self.highlight_dot.set_data([self.current_frame], [val])
+        current_x = self.current_frame
+        if self.playhead_line is not None:
+            self.playhead_line.set_xdata([current_x, current_x])
+            self.playhead_line.set_visible(show_marker)
+        values = [elbow_val, knee_val]
+        for dot, y_val in zip(self.highlight_dots, values):
+            if show_marker and not np.isnan(y_val):
+                dot.set_data([current_x], [y_val])
+            else:
+                dot.set_data([], [])
         self.canvas.draw_idle()
 
-        pid_show = None
-        for pid in list(self.linked_ids) + list(self.history_ids):
-            if pid in self.id_angle_data:
-                cf = min(self.current_frame, self.id_angle_data[pid].shape[0]-1)
-                if not np.all(np.isnan(self.id_angle_data[pid][cf])):
-                    pid_show = pid
-                    break
-
-        if pid_show is not None:
-            cf = min(self.current_frame, self.id_angle_data[pid_show].shape[0]-1)
-            a  = self.id_angle_data[pid_show][cf]
+        if row:
+            pid_show = row.get("player_id")
+            shooting_hand = row.get("shooting_hand", "")
+            power_leg = row.get("power_leg", "")
             def _f(v): return f"{int(round(v))}°" if not np.isnan(v) else "--"
             self.angle_label.config(
                 text=(f"ID {pid_show}  ·  "
-                      f"L-Elbow: {_f(a[0])}   R-Elbow: {_f(a[1])}   "
-                      f"L-Knee: {_f(a[2])}   R-Knee: {_f(a[3])}"),
+                      f"{shooting_hand.title() or 'Shooting'} Elbow: "
+                      f"{_f(elbow_val)}   "
+                      f"{power_leg.title() or 'Power'} Knee: {_f(knee_val)}"),
                 fg=self.ACCENT)
+
+    def _ensure_event_markers(self, count):
+        while len(self.event_markers) < count:
+            marker, = self.ax.plot(
+                [], [], "o", ms=5, markerfacecolor="#FFFFFF",
+                markeredgecolor="#343A40", markeredgewidth=1.0, zorder=6)
+            text = self.ax.text(
+                0, 0, "", fontsize=9, color="#343A40",
+                ha="center", va="bottom", visible=False,
+                bbox=dict(boxstyle="round,pad=0.18", fc="#FFFFFF",
+                          ec="#CED4DA", alpha=0.92))
+            self.event_markers.append((marker, text))
+
+    def _draw_event_markers(self, shot_rows):
+        event_specs = [
+            ("is_knee_lowest_frame", "Knee Min", "knee"),
+            ("is_elbow_lowest_frame", "Elbow Min", "elbow"),
+            ("is_elbow_max_extension_frame", "Elbow Max", "elbow"),
+            ("is_knee_max_extension_frame", "Knee Max", "knee"),
+        ]
+        points = []
+        for flag, label, series in event_specs:
+            matches = [r for r in shot_rows if r.get(flag)]
+            if not matches:
+                continue
+            row = matches[0]
+            shooting_hand = row.get("shooting_hand", "")
+            power_leg = row.get("power_leg", "")
+            if series == "elbow":
+                y_val = (
+                    row.get("left_elbow_angle", np.nan)
+                    if shooting_hand == "left" else
+                    row.get("right_elbow_angle", np.nan)
+                    if shooting_hand == "right" else np.nan
+                )
+            else:
+                y_val = (
+                    row.get("left_knee_angle", np.nan)
+                    if power_leg == "left" else
+                    row.get("right_knee_angle", np.nan)
+                    if power_leg == "right" else np.nan
+                )
+            if np.isnan(y_val):
+                continue
+            points.append((row["frame"], y_val, label))
+
+        self._ensure_event_markers(len(points))
+        for idx, (marker, text) in enumerate(self.event_markers):
+            if idx >= len(points):
+                marker.set_data([], [])
+                text.set_visible(False)
+                continue
+            x_val, y_val, label = points[idx]
+            marker.set_data([x_val], [y_val])
+            y_top = self.ax.get_ylim()[1]
+            text.set_position((x_val, min(y_top - 10, y_val + 8)))
+            text.set_text(label)
+            text.set_visible(True)
+
+    def _invalidate_analysis_cache(self):
+        self._analysis_cache_key = None
+        self._analysis_rows_cache = None
+        self._analysis_rows_by_frame = {}
+
+    def _get_analysis_rows(self, ids_to_show=None):
+        if ids_to_show is None:
+            ids_to_show = self.history_ids
+        cache_key = (tuple(sorted(ids_to_show)), self._manual_recalc_version)
+        if self._analysis_cache_key == cache_key and self._analysis_rows_cache is not None:
+            return self._analysis_rows_cache
+
+        rows = []
+        for pid in sorted(ids_to_show):
+            rows.extend(self.id_analysis_rows.get(pid, []))
+        rows = self._renumber_merged_rows(rows) if rows else []
+
+        self._analysis_cache_key = cache_key
+        self._analysis_rows_cache = rows
+        self._analysis_rows_by_frame = {}
+        for row in rows:
+            if row.get("shot_id") == "":
+                continue
+            self._analysis_rows_by_frame.setdefault(row["frame"], []).append(row)
+        return rows
+
+    def _get_analysis_row_for_frame(self, frame_idx, preferred_ids=None):
+        self._get_analysis_rows()
+        matches = self._analysis_rows_by_frame.get(frame_idx, [])
+        if not matches:
+            return None
+        if preferred_ids:
+            for row in matches:
+                if row.get("player_id") in preferred_ids:
+                    return row
+        return matches[0]
+
+    def _refresh_summary_table(self):
+        if not hasattr(self, "summary_container"):
+            return
+        for child in self.summary_container.winfo_children():
+            child.destroy()
+        if not self.history_ids:
+            self._update_summary_scroll_region()
+            return
+
+        rows = self._get_analysis_rows()
+        summary_rows = self._build_summary_rows(rows)
+        shot_ids = sorted({r["shot_id"] for r in summary_rows})
+        if self._selected_shot_id not in shot_ids:
+            self._selected_shot_id = shot_ids[0] if shot_ids else None
+        label_map = {
+            "knee_lowest": "Knee Min",
+            "elbow_lowest": "Elbow Min",
+            "release_proxy": "Release",
+            "elbow_max_extension": "Elbow Max",
+            "knee_max_extension": "Knee Max",
+            "observed_knee_max_extension_unconfirmed": "Knee Max*",
+        }
+
+        def _fmt_angle(value):
+            try:
+                if np.isnan(value):
+                    return ""
+            except TypeError:
+                pass
+            return f"{float(value):.1f}"
+
+        for shot_id in shot_ids:
+            shot_summary = [r for r in summary_rows if r["shot_id"] == shot_id]
+            if not shot_summary:
+                continue
+            shot_data = [r for r in rows if r.get("shot_id") == shot_id]
+            shot_start = min((r["frame"] for r in shot_data), default="")
+            shot_end = max((r["frame"] for r in shot_data), default="")
+            hand = shot_summary[0].get("shooting_hand", "")
+            leg = shot_summary[0].get("power_leg", "")
+            pending = self._pending_shot_sides.get(shot_id, {})
+            display_hand = pending.get("shooting_hand", hand)
+            display_leg = pending.get("power_leg", leg)
+            pending_note = "  Pending" if pending else ""
+            selected = shot_id == self._selected_shot_id
+            border = self.ACCENT if selected else self.BORDER
+            card_bg = self.ACCENT_LT if selected else "#FFFFFF"
+
+            card = tk.Frame(
+                self.summary_container, bg=card_bg,
+                highlightbackground=border, highlightthickness=2 if selected else 1)
+            card.pack(fill="x", pady=(0,5))
+            card.bind("<Button-1>", lambda _e, sid=shot_id: self._select_shot(sid))
+
+            card_body = tk.Frame(card, bg=card_bg)
+            card_body.pack(fill="x", padx=7, pady=6)
+            card_body.bind("<Button-1>", lambda _e, sid=shot_id: self._select_shot(sid))
+
+            side_panel = tk.Frame(card_body, bg=card_bg)
+            side_panel.pack(side="left", fill="y", padx=(0,6))
+            info_lines = [
+                f"Shot #{shot_id}",
+                f"Frames: {shot_start}-{shot_end}",
+                f"Hand: {display_hand or '--'}",
+                f"Leg: {display_leg or '--'}",
+            ]
+            for line in info_lines:
+                tk.Label(
+                    side_panel, text=line, bg=card_bg, fg=self.TEXT,
+                    font=("Menlo", 11, "bold"), width=18,
+                    padx=4, pady=2, anchor="w"
+                ).pack(anchor="w", fill="x")
+
+            change_box = tk.Frame(side_panel, bg=card_bg)
+            change_box.pack(anchor="w", pady=(5,2))
+            hand_toggle = tk.Button(
+                change_box, text="Change🤚", bg=self.BTN_SURF, fg=self.BTN_TEXT,
+                activebackground=self.BTN_HOVER, activeforeground=self.BTN_TEXT,
+                font=("Menlo", 10), relief="flat", padx=6, pady=2,
+                cursor="hand2",
+                command=lambda sid=shot_id: self._toggle_pending_shot_side(sid, "hand"))
+            hand_toggle.pack(side="left", padx=(0,4))
+            leg_toggle = tk.Button(
+                change_box, text="Change🦶", bg=self.BTN_SURF, fg=self.BTN_TEXT,
+                activebackground=self.BTN_HOVER, activeforeground=self.BTN_TEXT,
+                font=("Menlo", 10), relief="flat", padx=6, pady=2,
+                cursor="hand2",
+                command=lambda sid=shot_id: self._toggle_pending_shot_side(sid, "leg"))
+            leg_toggle.pack(side="left")
+
+            apply_box = tk.Frame(side_panel, bg=card_bg)
+            apply_box.pack(anchor="w", pady=(2,0))
+            apply_toggle = tk.Button(
+                apply_box, text="Apply", bg=self.BTN_SURF,
+                fg=self.SUCCESS if pending else self.TEXT_DIM,
+                activebackground=self.BTN_HOVER, activeforeground=self.BTN_TEXT,
+                font=("Menlo", 10, "bold"), relief="flat", padx=8, pady=2,
+                cursor="hand2",
+                command=lambda sid=shot_id: self._apply_pending_shot_sides(sid))
+            apply_toggle.pack(side="left")
+            tk.Label(
+                side_panel, text="pending" if pending else " ",
+                bg=card_bg, fg=self.ACCENT2,
+                font=("Menlo", 11, "bold"), padx=4, pady=2
+            ).pack(anchor="w")
+
+            table = tk.Frame(card_body, bg="#FFFFFF")
+            table.pack(side="left", fill="x", expand=True)
+            cols = ("Event", "Frame", "Time", "Elbow", "Knee", "Hip")
+            widths = [16, 8, 8, 8, 8, 8]
+            for col_idx, (col, width) in enumerate(zip(cols, widths)):
+                tk.Label(
+                    table, text=col, bg="#F0F0F0", fg=self.TEXT,
+                    font=("Menlo", 11, "bold"), width=width,
+                    padx=3, pady=3, anchor="center",
+                    highlightbackground=self.BORDER, highlightthickness=1
+                ).grid(row=0, column=col_idx, sticky="nsew")
+                table.grid_columnconfigure(col_idx, weight=1)
+
+            for row_idx, row in enumerate(shot_summary, start=1):
+                label = row.get("event_label", "")
+                event_key = label.split("_", 2)[2] if label.count("_") >= 2 else label
+                event_name = label_map.get(event_key, event_key)
+                elbow_display = ""
+                knee_display = ""
+                if event_key in (
+                    "elbow_lowest", "release_proxy", "elbow_max_extension"
+                ):
+                    elbow_display = _fmt_angle(
+                        row.get("shooting_elbow_angle_deg", np.nan))
+                if event_key in (
+                    "knee_lowest", "release_proxy", "knee_max_extension",
+                    "observed_knee_max_extension_unconfirmed"
+                ):
+                    knee_display = _fmt_angle(
+                        row.get("power_knee_angle_deg", np.nan))
+                values = (
+                    event_name,
+                    row.get("frame_number", ""),
+                    f"{float(row.get('time_sec', 0.0)):.2f}",
+                    elbow_display,
+                    knee_display,
+                    _fmt_angle(row.get("hip_height_norm", np.nan)),
+                )
+                for col_idx, (value, width) in enumerate(zip(values, widths)):
+                    bg = "#E6F0FF" if col_idx == 0 else "#FFFFFF"
+                    weight = "bold" if col_idx == 0 else "normal"
+                    tk.Label(
+                        table, text=value, bg=bg, fg=self.TEXT,
+                        font=("Menlo", 11, weight), width=width,
+                        padx=3, pady=2, anchor="center",
+                        highlightbackground=self.BORDER, highlightthickness=1
+                    ).grid(row=row_idx, column=col_idx, sticky="nsew")
+        self._update_summary_scroll_region()
+
+    def _update_summary_scroll_region(self):
+        if not hasattr(self, "summary_canvas"):
+            return
+        self.summary_container.update_idletasks()
+        bbox = self.summary_canvas.bbox("all")
+        if not bbox:
+            self.summary_canvas.configure(height=40, scrollregion=(0, 0, 0, 0))
+            if hasattr(self, "summary_scroll"):
+                self.summary_scroll.grid_remove()
+            if hasattr(self, "summary_hscroll"):
+                self.summary_hscroll.grid_remove()
+            return
+        content_w = bbox[2] - bbox[0]
+        content_h = bbox[3] - bbox[1]
+        max_h = max(120, self.summary_canvas.master.winfo_height() - 4)
+        target_h = min(content_h + 4, max_h)
+        self.summary_canvas.configure(height=target_h, scrollregion=bbox)
+        view_w = max(1, self.summary_canvas.winfo_width())
+        if hasattr(self, "summary_hscroll"):
+            if content_w > view_w + 2:
+                if not self.summary_hscroll.winfo_ismapped():
+                    self.summary_hscroll.grid(row=1, column=0, sticky="ew")
+            else:
+                self.summary_hscroll.grid_remove()
+        if hasattr(self, "summary_scroll"):
+            if content_h > max_h:
+                if not self.summary_scroll.winfo_ismapped():
+                    self.summary_scroll.grid(row=0, column=1, sticky="ns")
+            else:
+                self.summary_scroll.grid_remove()
+
+    @staticmethod
+    def _opposite_side(side):
+        return "right" if side == "left" else "left"
+
+    def _select_shot(self, shot_id):
+        self._selected_shot_id = shot_id
+        self.update_full_graph()
+        self._refresh_summary_table()
+        self.update_highlight()
+
+    def _toggle_pending_shot_side(self, shot_id, side_kind):
+        rows = self._get_analysis_rows()
+        shot_rows = [r for r in rows if r.get("shot_id") == shot_id]
+        if not shot_rows:
+            return
+        current_hand = shot_rows[0].get("shooting_hand", "")
+        current_leg = shot_rows[0].get("power_leg", "")
+        pending = dict(self._pending_shot_sides.get(shot_id, {}))
+        if side_kind == "hand" and current_hand in ("left", "right"):
+            base = pending.get("shooting_hand", current_hand)
+            pending["shooting_hand"] = self._opposite_side(base)
+        elif side_kind == "leg" and current_leg in ("left", "right"):
+            base = pending.get("power_leg", current_leg)
+            pending["power_leg"] = self._opposite_side(base)
+        else:
+            return
+        self._pending_shot_sides[shot_id] = pending
+        self._selected_shot_id = shot_id
+        self._refresh_summary_table()
+
+    def _apply_pending_shot_sides(self, shot_id):
+        rows = self._get_analysis_rows()
+        shot_rows = [r for r in rows if r.get("shot_id") == shot_id]
+        if not shot_rows:
+            return
+        pending = dict(self._pending_shot_sides.get(shot_id, {}))
+        current_hand = shot_rows[0].get("shooting_hand", "")
+        current_leg = shot_rows[0].get("power_leg", "")
+        next_hand = pending.get("shooting_hand", current_hand)
+        next_leg = pending.get("power_leg", current_leg)
+        auto_hand, auto_leg = self._get_auto_shot_sides(shot_id)
+        if next_hand == auto_hand and next_leg == auto_leg:
+            self._manual_shot_sides.pop(shot_id, None)
+        else:
+            self._manual_shot_sides[shot_id] = {
+                "shooting_hand": next_hand,
+                "power_leg": next_leg,
+            }
+        self._pending_shot_sides.pop(shot_id, None)
+        self._manual_recalc_version += 1
+        self._invalidate_analysis_cache()
+        self._selected_shot_id = shot_id
+        self.update_full_graph()
+        self._refresh_summary_table()
+        self.update_highlight()
 
     # ── Data export helpers ───────────────────────────────────────────────────
 
@@ -703,10 +1208,256 @@ class BasketballAnalyzerApp:
             return pid, kp, angles
         return None, None, None
 
-    def _build_export_rows(self):
+    def _get_id_sample_at_frame(self, target_id, frame_idx):
+        data = self.cache[frame_idx]
+        ids = data.get("ids", [])
+        kps = data.get("kps", [])
+
+        for i, pid in enumerate(ids):
+            if pid != target_id or i >= len(kps):
+                continue
+            kp = np.array(kps[i])
+            if len(kp) < 17:
+                continue
+            angles = np.full(4, np.nan)
+            if pid in self.id_angle_data:
+                safe = min(frame_idx, self.id_angle_data[pid].shape[0] - 1)
+                angles = self.id_angle_data[pid][safe]
+            angles = self._sanitize_angles(kp, angles)
+            return pid, kp, angles
+        return None, None, None
+
+    def _precompute_all_id_analysis(self):
+        self.id_analysis_rows = {}
+        all_ids = sorted(self.id_angle_data.keys())
+        if not all_ids:
+            return
+        print(f"⏳ Pre-computing shot windows for {len(all_ids)} IDs…")
+        for pid in all_ids:
+            rows = self._build_rows_for_id(pid)
+            self.id_analysis_rows[pid] = rows
+            shot_count = len({r["shot_id"] for r in rows if r["shot_id"] != ""})
+            if shot_count:
+                print(f"  ID {pid}: {shot_count} shot window(s)")
+        print("✅ Shot-window pre-computation finished")
+
+    def _renumber_merged_rows(self, rows, apply_manual_overrides=True):
+        merged = [dict(row) for row in rows]
+        shot_first_frames = {}
+        for row in merged:
+            sid = row.get("shot_id")
+            if sid == "":
+                continue
+            key = (row.get("player_id"), sid)
+            frame = row.get("frame", self.total_frames)
+            if key not in shot_first_frames or frame < shot_first_frames[key]:
+                shot_first_frames[key] = frame
+        shot_keys = sorted(shot_first_frames, key=lambda key: shot_first_frames[key])
+        shot_map = {key: idx for idx, key in enumerate(shot_keys, start=1)}
+
+        for row in merged:
+            sid = row.get("shot_id")
+            if sid == "":
+                continue
+            old_shot_id = sid
+            new_shot_id = shot_map[(row.get("player_id"), old_shot_id)]
+            row["shot_id"] = new_shot_id
+            if apply_manual_overrides:
+                override = self._manual_shot_sides.get(new_shot_id, {})
+                if override.get("shooting_hand"):
+                    row["shooting_hand"] = override["shooting_hand"]
+                if override.get("power_leg"):
+                    row["power_leg"] = override["power_leg"]
+            label = row.get("event_label", "")
+            if label:
+                row["event_label"] = label.replace(
+                    f"shot_{old_shot_id}_", f"shot_{new_shot_id}_")
+        if apply_manual_overrides:
+            for shot_id, override in self._manual_shot_sides.items():
+                if override:
+                    self._recompute_overridden_shot_events(merged, shot_id)
+        merged.sort(key=lambda r: (r["frame"], r["player_id"]))
+        return merged
+
+    def _get_auto_shot_sides(self, shot_id):
+        rows = []
+        for pid in sorted(self.history_ids):
+            rows.extend(self.id_analysis_rows.get(pid, []))
+        base_rows = self._renumber_merged_rows(rows, apply_manual_overrides=False)
+        shot_rows = [r for r in base_rows if r.get("shot_id") == shot_id]
+        if not shot_rows:
+            return "", ""
+        return (
+            shot_rows[0].get("shooting_hand", ""),
+            shot_rows[0].get("power_leg", ""),
+        )
+
+    def _recompute_overridden_shot_events(self, rows, shot_id):
+        shot_rows = [r for r in rows if r.get("shot_id") == shot_id]
+        if not shot_rows:
+            return
+
+        event_flags = [
+            "is_knee_lowest_frame", "is_elbow_lowest_frame",
+            "is_elbow_max_extension_frame", "is_knee_max_extension_frame",
+            "is_observed_knee_max_extension_frame", "is_max_extension_frame",
+        ]
+        shot_prefix = f"shot_{shot_id}_"
+        analysis_frames = [
+            frame
+            for row in shot_rows
+            for frame in (
+                row.get("analysis_start_frame"),
+                row.get("analysis_end_frame"),
+            )
+            if frame != ""
+        ]
+        if analysis_frames:
+            analysis_start = int(min(analysis_frames))
+            analysis_end = int(max(analysis_frames))
+        else:
+            analysis_start = min(r["frame"] for r in shot_rows)
+            analysis_end = max(r["frame"] for r in shot_rows)
+
+        for row in rows:
+            if not (analysis_start <= row["frame"] <= analysis_end):
+                continue
+            labels = [
+                label for label in str(row.get("event_label", "")).split("|")
+                if label
+            ]
+            if row.get("shot_id") not in ("", shot_id) and not any(
+                label.startswith(shot_prefix) for label in labels
+            ):
+                continue
+            for flag in event_flags:
+                row[flag] = False
+            row["knee_max_extension_confirmed"] = ""
+            row["event_label"] = "|".join(
+                label for label in labels
+                if not label.startswith(shot_prefix)
+            )
+
+        shooting_hand = shot_rows[0].get("shooting_hand", "")
+        power_leg = shot_rows[0].get("power_leg", "")
+        release_rows = [r for r in shot_rows if r.get("is_release_frame")]
+        release_row = release_rows[0] if release_rows else None
+        if release_row is not None:
+            release_row["event_label"] = self._append_event_label(
+                release_row.get("event_label", ""), f"{shot_prefix}release_proxy")
+
+        release_frame = (
+            release_row["frame"] if release_row is not None
+            else max(r["frame"] for r in shot_rows)
+        )
+        window_rows = [
+            r for r in rows
+            if analysis_start <= r["frame"] <= analysis_end and
+            (r.get("shot_id") in ("", shot_id))
+        ]
+
+        def _side_angle(row, side, joint):
+            if joint == "elbow":
+                return row.get(f"{side}_elbow_angle", np.nan)
+            return row.get(f"{side}_knee_angle", np.nan)
+
+        def _mark(row, flag, label, max_ext=False):
+            if row is None:
+                return
+            row[flag] = True
+            if max_ext:
+                row["is_max_extension_frame"] = True
+            row["event_label"] = self._append_event_label(
+                row.get("event_label", ""), f"{shot_prefix}{label}")
+
+        knee_candidates = [
+            r for r in window_rows
+            if r["frame"] < release_frame and power_leg in ("left", "right") and
+            not np.isnan(_side_angle(r, power_leg, "knee"))
+        ]
+        knee_low_row = (
+            min(knee_candidates, key=lambda r: _side_angle(r, power_leg, "knee"))
+            if knee_candidates else None
+        )
+        _mark(knee_low_row, "is_knee_lowest_frame", "knee_lowest")
+
+        elbow_candidates = [
+            r for r in window_rows
+            if shooting_hand in ("left", "right") and
+            not np.isnan(_side_angle(r, shooting_hand, "elbow")) and
+            r["frame"] < release_frame
+        ]
+        if knee_low_row is not None:
+            after_knee = [r for r in elbow_candidates if r["frame"] > knee_low_row["frame"]]
+            if after_knee:
+                elbow_candidates = after_knee
+        elbow_low_row = (
+            min(elbow_candidates, key=lambda r: _side_angle(r, shooting_hand, "elbow"))
+            if elbow_candidates else None
+        )
+        _mark(elbow_low_row, "is_elbow_lowest_frame", "elbow_lowest")
+
+        elbow_ext_candidates = [
+            r for r in window_rows
+            if shooting_hand in ("left", "right") and
+            not np.isnan(_side_angle(r, shooting_hand, "elbow")) and
+            r["frame"] > release_frame
+        ]
+        near = [
+            r for r in elbow_ext_candidates
+            if r["frame"] <= release_frame + max(2, int(round(0.15 * self.fps)))
+        ]
+        if near:
+            elbow_ext_candidates = near
+        elbow_max_row = (
+            max(elbow_ext_candidates,
+                key=lambda r: _side_angle(r, shooting_hand, "elbow"))
+            if elbow_ext_candidates else None
+        )
+        _mark(elbow_max_row, "is_elbow_max_extension_frame",
+              "elbow_max_extension", max_ext=True)
+
+        knee_ext_candidates = [
+            r for r in window_rows
+            if power_leg in ("left", "right") and
+            not np.isnan(_side_angle(r, power_leg, "knee")) and
+            r["frame"] > release_frame
+        ]
+        observed_knee_max_row = (
+            max(knee_ext_candidates, key=lambda r: _side_angle(r, power_leg, "knee"))
+            if knee_ext_candidates else None
+        )
+        knee_max_confirmed = False
+        if observed_knee_max_row is not None:
+            last_frame = max(r["frame"] for r in knee_ext_candidates)
+            enough_after_release = len(knee_ext_candidates) >= max(
+                3, int(round(0.12 * self.fps)))
+            reaches_window_end = last_frame >= analysis_end - 1
+            knee_max_confirmed = bool(enough_after_release and reaches_window_end)
+            observed_knee_max_row["is_observed_knee_max_extension_frame"] = True
+            observed_knee_max_row["knee_max_extension_confirmed"] = int(
+                knee_max_confirmed)
+            if not knee_max_confirmed:
+                observed_knee_max_row["event_label"] = self._append_event_label(
+                    observed_knee_max_row.get("event_label", ""),
+                    f"{shot_prefix}observed_knee_max_extension_unconfirmed")
+        knee_max_row = (
+            observed_knee_max_row if knee_max_confirmed else None
+        )
+        _mark(knee_max_row, "is_knee_max_extension_frame",
+              "knee_max_extension", max_ext=True)
+
+    @staticmethod
+    def _append_event_label(current, label):
+        labels = [part for part in str(current).split("|") if part]
+        if label not in labels:
+            labels.append(label)
+        return "|".join(labels)
+
+    def _build_rows_for_id(self, target_id):
         rows = []
         for frame_idx in range(self.total_frames):
-            pid, kp, angles = self._get_player_sample_at_frame(frame_idx)
+            pid, kp, angles = self._get_id_sample_at_frame(target_id, frame_idx)
             if pid is None:
                 continue
 
@@ -784,6 +1535,12 @@ class BasketballAnalyzerApp:
         shots = self._detect_shot_segments(rows)
         self._mark_shot_events(rows, shots)
         return rows
+
+    def _build_export_rows(self):
+        rows = []
+        for pid in sorted(self.history_ids):
+            rows.extend(self.id_analysis_rows.get(pid, []))
+        return self._renumber_merged_rows(rows)
 
     def _detect_shot_segments(self, rows):
         if not rows:
@@ -1163,9 +1920,12 @@ class BasketballAnalyzerApp:
                 if knee_max_confirmed:
                     knee_max_idx = observed_knee_max_idx
 
-            for row in rows[analysis_start:analysis_end + 1]:
-                row["shooting_hand"] = shooting_hand
-                row["power_leg"] = power_leg
+            label_start = min(start, analysis_start)
+            label_end = max(end, analysis_end)
+            for row in rows[label_start:label_end + 1]:
+                if row["shot_id"] in ("", shot_id):
+                    row["shooting_hand"] = shooting_hand
+                    row["power_leg"] = power_leg
 
             for local_idx, label, key in [
                 (knee_low_idx, "knee_lowest", "is_knee_lowest_frame"),
@@ -1200,12 +1960,15 @@ class BasketballAnalyzerApp:
                     )
 
     def _export_csv(self):
+        if not self.video_path:
+            self._update_status("Open a video before exporting CSV.")
+            return
         if not self.history_ids:
             self._update_status("Select a player before exporting CSV.")
             return
 
         self.paused = True
-        self.play_btn.config(text="▶  Play")
+        self.play_btn.config(text="Play")
         self._update_status("Building export rows...")
         self.root.update_idletasks()
 
@@ -1247,6 +2010,13 @@ class BasketballAnalyzerApp:
     # ── Frame rendering ───────────────────────────────────────────────────────
 
     def _render_frame(self, update_chart=True, seek=True):
+        if not self.video_path or self.cap is None or not self.cache:
+            self._render_empty_video()
+            if update_chart:
+                self.update_full_graph(set())
+            self._update_lost_status()
+            return
+
         safe_frame = min(self.current_frame, len(self.cache)-1)
         if seek:
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, safe_frame)
@@ -1261,6 +2031,13 @@ class BasketballAnalyzerApp:
         ids   = data.get("ids",   [])
         boxes = data.get("boxes", [])
         kps   = data.get("kps",   [])
+        current_history_ids = self._get_frame_history_ids()
+        shot_row = (
+            self._get_analysis_row_for_frame(
+                safe_frame, preferred_ids=current_history_ids)
+            if self.history_ids else None
+        )
+        shot_player_id = shot_row.get("player_id") if shot_row else None
 
         for i, pid in enumerate(ids):
             if i >= len(boxes) or i >= len(kps):
@@ -1270,14 +2047,31 @@ class BasketballAnalyzerApp:
 
             kp_arr     = np.array(kps[i])
             is_tracked = (pid in self.history_ids)
-            box_color  = (60, 60, 220) if is_tracked else (30, 180, 180)
-            box_thick  = 3             if is_tracked else 1
+            in_shot_window = is_tracked and shot_player_id == pid
+            box_color  = (0, 95, 215) if is_tracked else (30, 180, 180)
+            box_thick  = 2 if is_tracked else 1
+            if in_shot_window:
+                box_thick = 3
             cv2.rectangle(out, (x1,y1), (x2,y2), box_color, box_thick)
+            if in_shot_window:
+                tag_h = 28
+                tag_y1 = max(0, y1 - tag_h)
+                tag_w = 86
+                cv2.rectangle(out, (x1, tag_y1), (x1 + tag_w, y1),
+                              box_color, -1)
+                cv2.rectangle(out, (x1, tag_y1), (x1 + tag_w, y1),
+                              box_color, 2)
+                cv2.putText(out, "SHOT", (x1 + 11, max(tag_y1 + 21, 21)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255,255,255), 2,
+                            cv2.LINE_AA)
 
-            lbl_color = (60, 60, 220) if is_tracked else (30, 180, 180)
-            cv2.putText(out, f"ID:{pid}", (x1, max(y1-8, 14)),
+            lbl_color = (0, 95, 215) if is_tracked else (30, 180, 180)
+            id_text = f"ID:{pid}"
+            id_x = min(max(x1 + 6, x2 - 72), out.shape[1] - 76)
+            id_y = min(max(y1 + 22, 22), out.shape[0] - 8)
+            cv2.putText(out, id_text, (id_x, id_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0,0,0), 3)
-            cv2.putText(out, f"ID:{pid}", (x1, max(y1-8, 14)),
+            cv2.putText(out, id_text, (id_x, id_y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.58, lbl_color, 1)
 
             if len(kp_arr) >= 17:
@@ -1298,9 +2092,9 @@ class BasketballAnalyzerApp:
         pil   = Image.fromarray(rgb)
         pil   = pil.resize((self.display_w, self.display_h), Image.LANCZOS)
         photo = ImageTk.PhotoImage(pil)
-        self.video_label.config(image=photo,
-                                width=self.display_w, height=self.display_h)
+        self.video_label.config(image=photo)
         self.video_label.image = photo
+        self._update_video_scroll_region()
 
         self.timeline_var.set(self.current_frame)
         total_frame_idx = max(0, self.total_frames - 1)
@@ -1312,13 +2106,43 @@ class BasketballAnalyzerApp:
             self.update_highlight()
         self._update_lost_status()
 
+    def _render_empty_video(self, message=None):
+        message = message or "Click Open Video to choose a basketball video"
+        out = np.full((max(self.display_h, 240), max(self.display_w, 320), 3),
+                      (233, 236, 239), dtype=np.uint8)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.8
+        thickness = 2
+        text_size = cv2.getTextSize(message, font, scale, thickness)[0]
+        x = max(16, (out.shape[1] - text_size[0]) // 2)
+        y = max(40, out.shape[0] // 2)
+        cv2.putText(out, message, (x, y), font, scale, (73,80,87),
+                    thickness, cv2.LINE_AA)
+        rgb = cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        pil = pil.resize((self.display_w, self.display_h), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(pil)
+        self.video_label.config(image=photo)
+        self.video_label.image = photo
+        self._update_video_scroll_region()
+        self.timeline_var.set(0)
+        self.frame_label.config(text="No video loaded")
+
     # ── UI builder ────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         r = self.root
-        r.title("AI Basketball Motion Analyzer  ·  Ryan Su  |  Midland School '27")
+        r.title("AI Basketball Motion Analyzer")
         r.configure(bg=self.BG)
         r.resizable(True, True)
+        try:
+            screen_w = r.winfo_screenwidth()
+            screen_h = r.winfo_screenheight()
+            win_w = int(screen_w * 0.85)
+            win_h = int(screen_h * 0.85)
+        except Exception:
+            win_w, win_h = 1400, 900
+        r.geometry(f"{win_w}x{win_h}")
 
         style = ttk.Style()
         style.theme_use("clam")
@@ -1332,100 +2156,198 @@ class BasketballAnalyzerApp:
         title_bar.pack(fill="x", side="top")
         tk.Label(title_bar, text="🏀  AI Basketball Motion Analyzer",
                  bg=self.SURFACE, fg=self.ACCENT,
-                 font=("Menlo", 14, "bold")).pack(side="left", padx=16, pady=10)
+                 font=("Menlo", 16, "bold")).pack(side="left", padx=16, pady=10)
         self.title_hint = tk.Label(
             title_bar,
             text="Click a player in the video to start tracking",
-            bg=self.SURFACE, fg=self.TEXT_DIM, font=("Menlo", 9))
+            bg=self.SURFACE, fg=self.TEXT_DIM, font=("Menlo", 11))
         self.title_hint.pack(side="right", padx=16)
 
-        content = tk.Frame(r, bg=self.BG)
+        body = tk.Frame(r, bg=self.BG)
+        body.pack(fill="both", expand=True)
+        self.main_canvas = tk.Canvas(body, bg=self.BG, highlightthickness=0)
+        self.main_scroll = ttk.Scrollbar(
+            body, orient="vertical", command=self.main_canvas.yview)
+        self.main_canvas.configure(yscrollcommand=self.main_scroll.set)
+        self.main_canvas.pack(side="left", fill="both", expand=True)
+        self.main_scroll.pack(side="right", fill="y")
+        content_holder = tk.Frame(self.main_canvas, bg=self.BG)
+        self.main_canvas_window = self.main_canvas.create_window(
+            (0, 0), window=content_holder, anchor="nw")
+        content_holder.bind("<Configure>", self._on_main_content_configure)
+        self.main_canvas.bind("<Configure>", self._on_main_canvas_configure)
+        self.main_canvas.bind("<Enter>", self._bind_main_scroll)
+        self.main_canvas.bind("<Leave>", self._unbind_main_scroll)
+
+        content = tk.PanedWindow(
+            content_holder, orient="horizontal", bg=self.BG, sashwidth=6,
+            sashrelief="flat", bd=0)
         content.pack(fill="both", expand=True, padx=8, pady=(6,4))
 
         # LEFT
         left = tk.Frame(content, bg=self.SURFACE,
                         highlightbackground=self.BORDER, highlightthickness=1)
-        left.pack(side="left", fill="both", expand=True, padx=(0,4))
+        content.add(left, minsize=360)
 
-        tk.Label(left, text="VIDEO", bg=self.SURFACE, fg=self.TEXT_DIM,
-                 font=("Menlo", 8, "bold")).pack(anchor="w", padx=10, pady=(6,2))
+        left_panes = tk.PanedWindow(
+            left, orient="vertical", bg="#CED4DA", sashwidth=10,
+            sashrelief="raised", bd=0)
+        left_panes.pack(fill="both", expand=True)
 
-        self.video_label = tk.Label(left, bg="#1A1A2E",
-                                    width=self.display_w, height=self.display_h,
+        video_panel = tk.Frame(left_panes, bg=self.SURFACE)
+        self.video_panel = video_panel
+        left_panes.add(video_panel, minsize=130)
+
+        tk.Label(video_panel, text="VIDEO", bg=self.SURFACE, fg=self.TEXT_DIM,
+                 font=("Menlo", 10, "bold")).pack(anchor="w", padx=10, pady=(6,2))
+
+        video_scroll_frame = tk.Frame(video_panel, bg=self.SURFACE)
+        video_scroll_frame.pack(padx=8, pady=(0,4), fill="both", expand=True)
+        self.video_canvas = tk.Canvas(
+            video_scroll_frame, bg="#E9ECEF", highlightthickness=0)
+        self.video_hscroll = ttk.Scrollbar(
+            video_scroll_frame, orient="horizontal",
+            command=self.video_canvas.xview)
+        self.video_vscroll = ttk.Scrollbar(
+            video_scroll_frame, orient="vertical",
+            command=self.video_canvas.yview)
+        self.video_canvas.configure(
+            xscrollcommand=self.video_hscroll.set,
+            yscrollcommand=self.video_vscroll.set)
+        self.video_label = tk.Label(self.video_canvas, bg="#E9ECEF",
                                     cursor="crosshair")
-        self.video_label.pack(padx=8, pady=(0,4))
+        self.video_canvas_window = self.video_canvas.create_window(
+            (0, 0), window=self.video_label, anchor="nw")
+        self.video_canvas.grid(row=0, column=0, sticky="nsew")
+        video_scroll_frame.grid_rowconfigure(0, weight=1)
+        video_scroll_frame.grid_columnconfigure(0, weight=1)
         self.video_label.bind("<Button-1>", self._on_video_click)
+        self.video_canvas.bind("<Configure>", self._on_video_canvas_configure)
 
-        slider_row = tk.Frame(left, bg=self.SURFACE)
+        slider_row = tk.Frame(video_panel, bg=self.SURFACE)
         slider_row.pack(fill="x", padx=8, pady=(0,2))
         tk.Label(slider_row, text="⏱", bg=self.SURFACE, fg=self.TEXT_DIM,
-                 font=("Menlo", 9)).pack(side="left")
+                 font=("Menlo", 11)).pack(side="left")
         self.timeline_var = tk.IntVar(value=0)
-        self.slider = ttk.Scale(slider_row, from_=0, to=self.total_frames-1,
+        self.slider = ttk.Scale(slider_row, from_=0,
+                                to=max(0, self.total_frames-1),
                                 orient="horizontal", variable=self.timeline_var,
                                 command=self._on_slider_move)
         self.slider.pack(side="left", fill="x", expand=True, padx=(4,0))
 
-        ctrl = tk.Frame(left, bg=self.BG, pady=4)
+        ctrl = tk.Frame(video_panel, bg=self.BG, pady=4)
         ctrl.pack(fill="x", padx=8)
 
+        self.open_btn = tk.Button(
+            ctrl, text="Open Video",
+            bg=self.BTN_SURF, fg=self.BTN_TEXT,
+            activebackground=self.BTN_HOVER, activeforeground=self.BTN_TEXT,
+            font=("Menlo", 12), relief="flat", width=10,
+            padx=4, pady=6, cursor="hand2",
+            command=self._open_video)
+        self.open_btn.grid(row=0, column=0, padx=(0,4), pady=2, sticky="ew")
+
         self.play_btn = tk.Button(
-            ctrl, text="▶  Play",
+            ctrl, text="Play",
             bg=self.ACCENT, fg=self.BTN_TEXT,
             activebackground="#1560AE", activeforeground=self.BTN_TEXT,
-            font=("Menlo", 10, "bold"), relief="flat",
-            padx=16, pady=6, cursor="hand2",
+            font=("Menlo", 12), relief="flat", width=10,
+            padx=4, pady=6, cursor="hand2",
             command=self._toggle_play)
-        self.play_btn.pack(side="left", padx=(0,6))
+        self.play_btn.grid(row=0, column=1, padx=4, pady=2, sticky="ew")
 
         self.reset_btn = tk.Button(
             ctrl, text="↺  Reset",
             bg=self.BTN_SURF, fg=self.BTN_TEXT,
             activebackground=self.BTN_HOVER, activeforeground=self.BTN_TEXT,
-            font=("Menlo", 10), relief="flat",
-            padx=14, pady=6, cursor="hand2",
+            font=("Menlo", 12), relief="flat",
+            width=10, padx=4, pady=6, cursor="hand2",
             command=self._reset_ids)
-        self.reset_btn.pack(side="left")
+        self.reset_btn.grid(row=0, column=2, padx=4, pady=2, sticky="ew")
 
         self.export_btn = tk.Button(
             ctrl, text="Export CSV",
             bg=self.BTN_SURF, fg=self.BTN_TEXT,
             activebackground=self.BTN_HOVER, activeforeground=self.BTN_TEXT,
-            font=("Menlo", 10), relief="flat",
-            padx=14, pady=6, cursor="hand2",
+            font=("Menlo", 12), relief="flat",
+            width=10, padx=4, pady=6, cursor="hand2",
             command=self._export_csv)
-        self.export_btn.pack(side="left", padx=(6,0))
+        self.export_btn.grid(row=0, column=3, padx=(4,0), pady=2, sticky="ew")
 
-        self.frame_label = tk.Label(ctrl, text=f"0 / {self.total_frames-1}",
+        self.frame_label = tk.Label(ctrl, text="No video loaded",
                                     bg=self.BG, fg=self.TEXT_DIM,
-                                    font=("Menlo", 9))
-        self.frame_label.pack(side="right")
+                                    font=("Menlo", 11))
+        self.frame_label.grid(row=1, column=0, columnspan=4, sticky="e", pady=(2,0))
+        for col in range(4):
+            ctrl.grid_columnconfigure(col, weight=1, uniform="video_buttons")
 
-        tk.Label(left, text="Space = Play/Pause   ·   R = Reset   ·   Q = Quit",
+        tk.Label(video_panel, text="Space = Play/Pause   ·   R = Reset   ·   Q = Quit",
                  bg=self.SURFACE, fg=self.TEXT_DIM,
-                 font=("Menlo", 7)).pack(pady=(2,6))
+                 font=("Menlo", 9)).pack(pady=(2,6))
+
+        summary_panel = tk.Frame(left_panes, bg=self.SURFACE)
+        left_panes.add(summary_panel, minsize=90)
+
+        summary_hdr = tk.Frame(summary_panel, bg=self.SURFACE)
+        summary_hdr.pack(fill="x", padx=10, pady=(0,2))
+        tk.Label(summary_hdr, text="SHOT KEYFRAME SUMMARY",
+                 bg=self.SURFACE, fg=self.TEXT_DIM,
+                 font=("Menlo", 12, "bold")).pack(side="left")
+
+        summary_scroll_frame = tk.Frame(summary_panel, bg=self.SURFACE)
+        summary_scroll_frame.pack(fill="both", expand=True, padx=8, pady=(0,6))
+        self.summary_canvas = tk.Canvas(
+            summary_scroll_frame, bg=self.SURFACE, height=40,
+            highlightthickness=0)
+        self.summary_container = tk.Frame(self.summary_canvas, bg=self.SURFACE)
+        self.summary_scroll = ttk.Scrollbar(
+            summary_scroll_frame, orient="vertical",
+            command=self.summary_canvas.yview)
+        self.summary_hscroll = ttk.Scrollbar(
+            summary_scroll_frame, orient="horizontal",
+            command=self.summary_canvas.xview)
+        self.summary_canvas.configure(
+            yscrollcommand=self.summary_scroll.set,
+            xscrollcommand=self.summary_hscroll.set)
+        self.summary_canvas.create_window(
+            (0, 0), window=self.summary_container, anchor="nw")
+        self.summary_container.bind(
+            "<Configure>",
+            lambda _e: self.summary_canvas.configure(
+                scrollregion=self.summary_canvas.bbox("all")))
+        self.summary_canvas.grid(row=0, column=0, sticky="nsew")
+        summary_scroll_frame.grid_rowconfigure(0, weight=1)
+        summary_scroll_frame.grid_columnconfigure(0, weight=1)
+        self.summary_canvas.bind("<Enter>", self._bind_summary_scroll)
+        self.summary_container.bind("<Enter>", self._bind_summary_scroll)
+        self.summary_canvas.bind("<Leave>", self._unbind_summary_scroll)
+        self.summary_container.bind("<Leave>", self._unbind_summary_scroll)
+        self._refresh_summary_table()
 
         # RIGHT
         right = tk.Frame(content, bg=self.SURFACE,
                          highlightbackground=self.BORDER, highlightthickness=1)
-        right.pack(side="left", fill="both", expand=True, padx=(4,0))
+        content.add(right, minsize=360)
 
         hdr = tk.Frame(right, bg=self.SURFACE)
         hdr.pack(fill="x", padx=10, pady=(6,0))
         tk.Label(hdr, text="JOINT ANGLE TIMELINE", bg=self.SURFACE,
-                 fg=self.TEXT_DIM, font=("Menlo", 8, "bold")).pack(side="left")
+                 fg=self.TEXT_DIM, font=("Menlo", 12, "bold")).pack(side="left")
         self.graph_status_lbl = tk.Label(hdr, text="", bg=self.SURFACE,
-                                         fg=self.SUCCESS, font=("Menlo", 8))
+                                         fg=self.SUCCESS, font=("Menlo", 12))
         self.graph_status_lbl.pack(side="right")
 
         self.chart_frame = tk.Frame(right, bg=self.SURFACE)
         self.chart_frame.pack(fill="both", expand=True, padx=6, pady=4)
 
+        self.chart_tabs_frame = tk.Frame(right, bg=self.SURFACE)
+        self.chart_tabs_frame.pack(fill="x", padx=8, pady=(0,4))
+
         self.angle_label = tk.Label(
             right,
             text="No player linked — click a player in the video to begin",
             bg=self.SURFACE, fg=self.TEXT_DIM,
-            font=("Menlo", 8), wraplength=400)
+            font=("Menlo", 12), wraplength=560)
         self.angle_label.pack(pady=(0,6))
 
         status_bar = tk.Frame(r, bg=self.STATUS_BG,
@@ -1434,8 +2356,11 @@ class BasketballAnalyzerApp:
         status_bar.pack(fill="x", side="bottom")
         self.status_label = tk.Label(status_bar, text="Ready",
                                      bg=self.STATUS_BG, fg=self.TEXT_DIM,
-                                     font=("Menlo", 8))
+                                     font=("Menlo", 10))
         self.status_label.pack(side="left", padx=10)
+        tk.Label(status_bar, text="Developed by Ryan Su",
+                 bg=self.STATUS_BG, fg=self.TEXT_DIM,
+                 font=("Menlo", 10)).pack(side="right", padx=10)
 
         r.bind("<space>", lambda e: self._toggle_play())
         r.bind("r",       lambda e: self._reset_ids())
@@ -1455,31 +2380,53 @@ class BasketballAnalyzerApp:
         self.ax.set_facecolor(ax_bg)
 
         lw     = 0.9
-        styles = ["-", "-", "--", "--"]
+        styles = ["-", "--"]
 
         self.chart_lines = [
             self.ax.plot([], [], color=c, lw=lw, linestyle=ls, label=lbl)[0]
             for c, ls, lbl in zip(self.CHART_COLORS, styles, self.CHART_LABELS)
         ]
-        self.highlight_dot, = self.ax.plot(
-            [], [], 'o', ms=7,
-            markerfacecolor=self.ACCENT2,
-            markeredgecolor="white", markeredgewidth=1.0, zorder=5)
+        self.release_line = self.ax.axvline(
+            0, color="#D9480F", lw=1.8, linestyle="-",
+            alpha=1.0, label="Release", visible=False, zorder=3)
+        self.playhead_line = self.ax.axvline(
+            0, color="#343A40", lw=1.0, linestyle=":",
+            alpha=0.9, visible=False, zorder=4)
+        self.highlight_dots = [
+            self.ax.plot([], [], 'o', ms=6,
+                         markerfacecolor=color,
+                         markeredgecolor="white",
+                         markeredgewidth=1.0, zorder=5)[0]
+            for color in self.CHART_COLORS
+        ]
 
-        self.ax.set_xlabel("Frame", fontsize=9, color=txt_clr)
-        self.ax.set_ylabel("Angle (°)", fontsize=9, color=txt_clr)
-        self.ax.set_ylim(0, 180)
-        self.ax.set_xlim(0, self.total_frames)
-        self.ax.tick_params(colors=txt_clr, labelsize=8)
+        self.ax.set_xlabel("Frame", fontsize=11, color=txt_clr)
+        self.ax.set_ylabel("Angle (°)", fontsize=11, color=txt_clr)
+        self.ax.set_ylim(0, 190)
+        self.ax.set_xlim(0, 1)
+        self.ax.tick_params(colors=txt_clr, labelsize=10)
+        self.ax_time = self.ax.twiny()
+        self.ax_time.set_xlim(0, 1 / self.fps)
+        self.ax_time.set_xlabel("Time (sec)", fontsize=10, color=txt_clr)
+        self.ax_time.tick_params(colors=txt_clr, labelsize=9)
+        self.ax_time.spines["top"].set_edgecolor(grid_clr)
         for spine in self.ax.spines.values():
             spine.set_edgecolor(grid_clr)
         self.ax.grid(True, alpha=0.6, color=grid_clr, linewidth=0.5)
-        self.ax.legend(loc="upper right", fontsize=8,
+        release_proxy = Line2D([0], [0], color="#D9480F", lw=1.8,
+                               linestyle="-", label="Release")
+        handles = self.chart_lines + [release_proxy]
+        self.ax.legend(handles=handles, loc="upper right", fontsize=10,
                        facecolor=fig_bg, edgecolor=grid_clr,
                        labelcolor=txt_clr, framealpha=0.9)
         self.ax.set_title(
-            "Solid = Elbow (upper limb)   ·   Dashed = Knee (lower limb)",
-            fontsize=7.5, color=self.TEXT_DIM, pad=4)
+            "Shooting elbow and power knee inside detected shot windows",
+            fontsize=10, color=self.TEXT_DIM, pad=6)
+        self.no_data_text = self.ax.text(
+            0.5, 0.5, "No Data Available",
+            transform=self.ax.transAxes, ha="center", va="center",
+            fontsize=13, color=self.TEXT_DIM)
+        self._set_chart_blank()
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.chart_frame)
         self.canvas.draw()
@@ -1488,6 +2435,8 @@ class BasketballAnalyzerApp:
     # ── Event handlers ────────────────────────────────────────────────────────
 
     def _on_video_click(self, event):
+        if not self.video_path:
+            return
         vid_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         vid_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         sx = vid_w / max(self.display_w, 1)
@@ -1502,10 +2451,12 @@ class BasketballAnalyzerApp:
                 else:
                     self.linked_ids = {pid}
                     self.history_ids = {pid}
+                self._invalidate_analysis_cache()
                 self._was_lost = False
                 self.paused    = False
-                self.play_btn.config(text="⏸  Pause")
+                self.play_btn.config(text="Pause")
                 self.update_full_graph()
+                self._refresh_summary_table()
                 self._schedule_playback()
                 self._update_status(
                     f"Linked ID {pid}  ·  Player identity: "
@@ -1513,37 +2464,185 @@ class BasketballAnalyzerApp:
                 print(f"[CLICK] ID={pid} | history={sorted(self.history_ids)}")
                 break
 
+    def _on_content_resize(self, event):
+        if event.width <= 0 or event.height <= 0:
+            return
+        if not hasattr(self, "video_panel"):
+            return
+        panel_w = max(160, self.video_panel.winfo_width() - 18)
+        fixed_h = 118
+        panel_h = max(110, self.video_panel.winfo_height() - fixed_h)
+        old_size = (self.display_w, self.display_h)
+        self._compute_display_size(
+            self.video_w, self.video_h, panel_w=panel_w, panel_h=panel_h)
+        if (self.display_w, self.display_h) != old_size:
+            self._render_frame(update_chart=False)
+        self._update_video_scroll_region()
+        self._update_summary_scroll_region()
+
+    def _on_video_canvas_configure(self, _event=None):
+        self._update_video_scroll_region()
+
+    def _update_video_scroll_region(self):
+        if not hasattr(self, "video_canvas"):
+            return
+        self.video_label.update_idletasks()
+        bbox = self.video_canvas.bbox("all")
+        if not bbox:
+            return
+        self.video_canvas.configure(scrollregion=bbox)
+        content_w = bbox[2] - bbox[0]
+        content_h = bbox[3] - bbox[1]
+        view_w = max(1, self.video_canvas.winfo_width())
+        view_h = max(1, self.video_canvas.winfo_height())
+        if content_w > view_w + 2:
+            if not self.video_hscroll.winfo_ismapped():
+                self.video_hscroll.grid(row=1, column=0, sticky="ew")
+        else:
+            self.video_hscroll.grid_remove()
+        if content_h > view_h + 2:
+            if not self.video_vscroll.winfo_ismapped():
+                self.video_vscroll.grid(row=0, column=1, sticky="ns")
+        else:
+            self.video_vscroll.grid_remove()
+
+    def _on_main_content_configure(self, _event=None):
+        if hasattr(self, "main_canvas"):
+            self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+
+    def _on_main_canvas_configure(self, event):
+        if not hasattr(self, "main_canvas_window"):
+            return
+        self.main_canvas.itemconfigure(
+            self.main_canvas_window, width=event.width, height=max(520, event.height))
+        self._on_content_resize(event)
+
+    def _bind_main_scroll(self, _event=None):
+        if hasattr(self, "main_canvas"):
+            self.main_canvas.focus_set()
+            self.main_canvas.bind_all("<MouseWheel>", self._on_main_mousewheel)
+
+    def _unbind_main_scroll(self, _event=None):
+        if hasattr(self, "main_canvas"):
+            self.main_canvas.unbind_all("<MouseWheel>")
+
+    def _on_main_mousewheel(self, event):
+        if not hasattr(self, "main_canvas"):
+            return
+        if event.delta == 0:
+            return
+        step = -1 if event.delta > 0 else 1
+        self.main_canvas.yview_scroll(step, "units")
+
+    def _bind_summary_scroll(self, _event=None):
+        if hasattr(self, "summary_canvas"):
+            self.summary_canvas.focus_set()
+            self.summary_canvas.bind_all("<MouseWheel>", self._on_summary_mousewheel)
+
+    def _unbind_summary_scroll(self, _event=None):
+        if hasattr(self, "summary_canvas"):
+            self.summary_canvas.unbind_all("<MouseWheel>")
+
+    def _on_summary_mousewheel(self, event):
+        if not hasattr(self, "summary_canvas"):
+            return
+        delta = event.delta
+        if delta == 0:
+            return
+        step = -1 if delta > 0 else 1
+        self.summary_canvas.yview_scroll(step, "units")
+
+    def _open_video(self):
+        path = filedialog.askopenfilename(
+            title="Select Basketball Video",
+            filetypes=[("Video files", "*.mp4 *.mov *.avi *.mkv")]
+        )
+        if path:
+            self._load_video(path)
+
+    def _reset_analysis_state(self):
+        self.current_frame = 0
+        self.paused = True
+        self.players_at_frame = []
+        self.linked_ids.clear()
+        self.history_ids.clear()
+        self._was_lost = False
+        self.id_analysis_rows = {}
+        self._manual_shot_sides = {}
+        self._pending_shot_sides = {}
+        self._selected_shot_id = None
+        self._current_chart_shot_id = None
+        self._invalidate_analysis_cache()
+
+    def _load_video(self, video_path):
+        self.paused = True
+        if self._after_id:
+            self.root.after_cancel(self._after_id)
+            self._after_id = None
+        if self.cap is not None:
+            self.cap.release()
+
+        self._reset_analysis_state()
+        self.video_path = video_path
+        self.play_btn.config(text="Play")
+        self._update_status("Loading and pre-processing video...")
+        self._render_empty_video("Pre-processing video... please wait")
+        self.update_full_graph(set())
+        self._refresh_summary_table()
+        self.root.update_idletasks()
+
+        self.cache, self.id_angle_data, self.total_frames = load_or_build_cache(
+            video_path)
+        self.cap = cv2.VideoCapture(video_path)
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self.video_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.video_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self._compute_display_size(self.video_w, self.video_h)
+        self.slider.configure(to=max(0, self.total_frames - 1))
+        self._precompute_all_id_analysis()
+        self.update_full_graph(set())
+        self._refresh_summary_table()
+        self._render_frame()
+        self._update_status(f"Loaded {os.path.basename(video_path)}")
+
     def _on_slider_move(self, value):
+        if not self.video_path or not self.cache:
+            return
         new_frame = min(int(float(value)), len(self.cache)-1)
         if new_frame != self.current_frame:
             self.current_frame = new_frame
             self._render_frame()
 
     def _toggle_play(self):
+        if not self.video_path or not self.cache:
+            self._update_status("Open a video before playback.")
+            return
         self.paused = not self.paused
         if self.paused:
-            self.play_btn.config(text="▶  Play")
+            self.play_btn.config(text="Play")
+            self.update_highlight()
         else:
-            self.play_btn.config(text="⏸  Pause")
+            self.play_btn.config(text="Pause")
             self._schedule_playback()
 
     def _schedule_playback(self):
-        if self.paused:
+        if self.paused or not self.video_path or not self.cache:
             return
         safe_max = len(self.cache) - 1
         if self.current_frame < safe_max:
             self.current_frame += 1
-            chart_every = max(1, int(round(self.fps / 6)))
-            update_chart = (self.current_frame % chart_every == 0)
-            self._render_frame(update_chart=update_chart, seek=False)
+            self._render_frame(update_chart=True, seek=False)
             delay_ms = max(1, int(1000 / self.fps))
             self._after_id = self.root.after(delay_ms, self._schedule_playback)
         else:
             self.paused = True
-            self.play_btn.config(text="▶  Play")
+            self.play_btn.config(text="Play")
             self._update_status("End of video")
 
     def _reset_ids(self):
+        if not self.video_path:
+            self._update_status("Open a video before resetting IDs.")
+            return
         """
         v2.4 Reset — frame-local deletion.
 
@@ -1566,8 +2665,10 @@ class BasketballAnalyzerApp:
             # Case A: no history ID visible → true lost, preserve all data
             lost = sorted(self.linked_ids)
             self.linked_ids.clear()
+            self._invalidate_analysis_cache()
             self.paused = True
-            self.play_btn.config(text="▶  Play")
+            self.play_btn.config(text="Play")
+            self._refresh_summary_table()
             self._update_status(
                 f"Tracking lost ({lost}).  "
                 f"History kept: {sorted(self.history_ids)}.  "
@@ -1588,10 +2689,12 @@ class BasketballAnalyzerApp:
             removed = sorted(target_ids)
             self.history_ids -= target_ids          # ← frame-local deletion
             self.linked_ids  -= target_ids          # keep linked_ids consistent
+            self._invalidate_analysis_cache()
 
             self.paused = True
-            self.play_btn.config(text="▶  Play")
+            self.play_btn.config(text="Play")
             self.update_full_graph()
+            self._refresh_summary_table()
 
             remaining = sorted(self.history_ids)
             if remaining:
@@ -1619,9 +2722,9 @@ class BasketballAnalyzerApp:
     def _quit(self):
         if self._after_id:
             self.root.after_cancel(self._after_id)
-        self.cap.release()
+        if self.cap is not None:
+            self.cap.release()
         plt.close(self.fig)
-        delete_cache()
         self.root.destroy()
 
 
@@ -1630,21 +2733,6 @@ class BasketballAnalyzerApp:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    picker = tk.Tk()
-    picker.withdraw()
-    video_path = filedialog.askopenfilename(
-        title="Select Basketball Video",
-        filetypes=[("Video files", "*.mp4 *.mov *.avi *.mkv")]
-    )
-    picker.destroy()
-
-    if not video_path:
-        print("No video selected — exiting.")
-        exit()
-
-    cache, id_angle_data, total_frames = load_or_build_cache(video_path)
-
     root = tk.Tk()
-    app  = BasketballAnalyzerApp(root, video_path,
-                                 cache, id_angle_data, total_frames)
+    app  = BasketballAnalyzerApp(root)
     root.mainloop()
