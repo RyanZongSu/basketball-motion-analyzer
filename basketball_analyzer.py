@@ -20,7 +20,7 @@ Changes in v2.4 (over v2.3):
           linked_ids is updated to remove the same IDs so it stays consistent,
           but it is NOT the primary target of deletion.
 """
-# New main root script for basketball motion analysis
+# New main root script for basketball analysis
 
 import os
 import pickle
