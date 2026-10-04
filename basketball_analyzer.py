@@ -479,7 +479,7 @@ class BasketballAnalyzerApp:
 
     def _build_ui(self):
         r = self.root
-        r.title("AI Basketball Motion Analyzer")
+        r.title("Basketball Motion Analyzer")
         r.configure(bg=self.BG)
         r.resizable(True, True)
         try:
@@ -501,7 +501,7 @@ class BasketballAnalyzerApp:
                              highlightbackground=self.BORDER,
                              highlightthickness=1, height=46)
         title_bar.pack(fill="x", side="top")
-        tk.Label(title_bar, text="🏀  AI Basketball Motion Analyzer",
+        tk.Label(title_bar, text="🏀  Basketball Motion Analyzer",
                  bg=self.SURFACE, fg=self.ACCENT,
                  font=("Menlo", 16, "bold")).pack(side="left", padx=16, pady=10)
         self.title_hint = tk.Label(
@@ -712,7 +712,7 @@ class BasketballAnalyzerApp:
                                      bg=self.STATUS_BG, fg=self.TEXT_DIM,
                                      font=("Menlo", 10))
         self.status_label.pack(side="left", padx=10)
-        tk.Label(status_bar, text="Developed by Ryan Su",
+        tk.Label(status_bar, text="© 2026 Ryan Su",
                  bg=self.STATUS_BG, fg=self.TEXT_DIM,
                  font=("Menlo", 10)).pack(side="right", padx=10)
 

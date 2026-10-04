@@ -1,47 +1,35 @@
-<<<<<<< HEAD
 # 导出数据文件，本地生成不上传
 *.csv
 output/
 output_csv/
-# Python缓存
+
+# Python缓存与备份
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 basketball_analyzer_backup.py
-=======
+
 # 虚拟环境
 basketball_env/
 venv/
 env/
 ENV/
 
-# 缓存
->>>>>>> dbef6b34fcb505b274739edcd48bc40c32f965e3
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-<<<<<<< HEAD
 # VS Code临时文件
 tempCodeRunnerFile.py
 .vscode/
-# 环境、日志
+
+# 环境、日志与导出
 *.log
 exports/
-*.csv
-output/
-output_csv/
-__pycache__/
-tempCodeRunnerFile.py
-.vscode/
-*.log
-.DS_Store
-*.pt
 run_env.sh
-=======
 
 # 系统文件
 .DS_Store
 Thumbs.db
 
-# 大文件
+# 大文件 / 模型权重 / 视频
 *.mp4
 *.avi
 *.mov
@@ -50,6 +38,5 @@ Thumbs.db
 *.gz
 *.h5
 *.pth
+*.pt
 *.onnx
-basketball_env/
->>>>>>> dbef6b34fcb505b274739edcd48bc40c32f965e3
