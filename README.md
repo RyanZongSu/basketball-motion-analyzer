@@ -1,4 +1,4 @@
-# 🏀 AI Basketball Motion Analyzer
+# 🏀 Basketball Motion Analyzer
 
 **Developer:** Ryan Su | Midland School, Class of 2027  
 **Tech Stack:** Python · YOLOv8 · OpenCV · NumPy
@@ -7,7 +7,7 @@
 
 ## 🎯 Project Overview
 
-An AI-powered tool that analyzes basketball shooting form in real-time, 
+A tool that analyzes basketball shooting form in real-time, 
 comparing player movements against professional benchmarks to provide 
 actionable feedback.
 
